@@ -40,6 +40,22 @@ After installation, an icon appears immediately in the menu bar (e.g. `S 19% · 
 
 Settings are persisted via `UserDefaults` and survive a restart.
 
+## Homescreen widget (optional, via Xcode)
+
+`ClaudeUsageBar.xcodeproj` builds the same menu bar app plus a WidgetKit extension, so your usage also shows up as a Home Screen / Notification Center widget — no need to open the menu to check.
+
+- **Small** — one bar per metric (Session, Woche), percentage shown inside the bar, color-coded (green/orange/red by usage level)
+- **Medium** — circular gauges for both metrics side by side
+
+App and widget share data through an App Group (`group.com.davidrensmann.claudeusagebar`), updated on every menu bar refresh.
+
+Unlike the plain `install.sh` build above, this path needs a **free or paid Apple Developer Team** assigned in Xcode — App Groups can't be ad-hoc signed:
+
+1. Open `ClaudeUsageBar.xcodeproj` in Xcode
+2. Select your Team under Signing & Capabilities on both the `ClaudeUsageBar` and `ClaudeUsageBarWidgetExtension` targets
+3. Build & run (⌘R)
+4. Add the widget from the Home Screen / Notification Center widget gallery ("Claude Usage")
+
 ## Uninstalling
 
 ```bash
