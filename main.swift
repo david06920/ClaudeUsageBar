@@ -1,5 +1,55 @@
 import Cocoa
 
+// Läuft einen Subprozess über posix_spawn und markiert ihn als "nicht verantwortlich"
+// gegenüber TCC (macOS-Berechtigungssystem). Ohne das wird jeder Datei-/Foto-/etc.-Zugriff
+// des Subprozesses (z. B. durch die claude-CLI) fälschlich dieser App zugeschrieben, und
+// macOS fragt bei jedem Aufruf erneut nach Berechtigungen, die die App selbst nie nutzt.
+private typealias DisclaimFn = @convention(c) (UnsafeMutablePointer<posix_spawnattr_t?>, Int32) -> Int32
+
+private func runDisclaimed(_ path: String, _ arguments: [String]) -> String? {
+    var attr: posix_spawnattr_t? = nil
+    posix_spawnattr_init(&attr)
+    defer { posix_spawnattr_destroy(&attr) }
+
+    if let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "responsibility_spawnattrs_setdisclaim") {
+        let disclaim = unsafeBitCast(sym, to: DisclaimFn.self)
+        _ = disclaim(&attr, 1)
+    }
+
+    var fileActions: posix_spawn_file_actions_t? = nil
+    posix_spawn_file_actions_init(&fileActions)
+    defer { posix_spawn_file_actions_destroy(&fileActions) }
+
+    let outPipe = Pipe()
+    let devNull = open("/dev/null", O_WRONLY)
+    posix_spawn_file_actions_adddup2(&fileActions, outPipe.fileHandleForWriting.fileDescriptor, 1)
+    posix_spawn_file_actions_adddup2(&fileActions, devNull, 2)
+
+    var argv: [UnsafeMutablePointer<CChar>?] = ([path] + arguments).map { strdup($0) }
+    argv.append(nil)
+    var envp: [UnsafeMutablePointer<CChar>?] = ProcessInfo.processInfo.environment.map { strdup("\($0.key)=\($0.value)") }
+    envp.append(nil)
+    defer {
+        argv.forEach { if let p = $0 { free(p) } }
+        envp.forEach { if let p = $0 { free(p) } }
+    }
+
+    var pid: pid_t = 0
+    let rc = posix_spawn(&pid, path, &fileActions, &attr, &argv, &envp)
+    close(devNull)
+    try? outPipe.fileHandleForWriting.close()
+
+    guard rc == 0 else {
+        try? outPipe.fileHandleForReading.close()
+        return nil
+    }
+
+    let data = outPipe.fileHandleForReading.readDataToEndOfFile()
+    var status: Int32 = 0
+    waitpid(pid, &status, 0)
+    return String(data: data, encoding: .utf8)
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate {
     var statusItem: NSStatusItem!
     var timer: Timer?
@@ -34,10 +84,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.title = "Claude …"
 
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "Jetzt aktualisieren", action: #selector(update), keyEquivalent: "r"))
-        menu.addItem(NSMenuItem(title: "Einstellungen…", action: #selector(openSettings), keyEquivalent: ","))
+        menu.addItem(NSMenuItem(title: "Refresh Now", action: #selector(update), keyEquivalent: "r"))
+        menu.addItem(NSMenuItem(title: "Settings…", action: #selector(openSettings), keyEquivalent: ","))
         menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Beenden", action: #selector(quit), keyEquivalent: "q"))
+        menu.addItem(NSMenuItem(title: "Quit", action: #selector(quit), keyEquivalent: "q"))
         statusItem.menu = menu
 
         update()
@@ -77,13 +127,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 320, height: 160),
                                    styleMask: [.titled, .closable],
                                    backing: .buffered, defer: false)
-            window.title = "Einstellungen"
+            window.title = "Settings"
             window.isReleasedWhenClosed = false
             window.center()
 
             let contentView = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 160))
 
-            let label = NSTextField(labelWithString: "Aktualisierung alle \(Int(refreshMinutes)) Min.")
+            let label = NSTextField(labelWithString: "Refresh every \(Int(refreshMinutes)) min")
             label.frame = NSRect(x: 20, y: 115, width: 280, height: 20)
             sliderLabel = label
 
@@ -103,7 +153,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             maxLabel.textColor = .secondaryLabelColor
             maxLabel.alignment = .right
 
-            let checkbox = NSButton(checkboxWithTitle: "Intelligent aktualisieren (ab 80% Nutzung alle 5 Min.)",
+            let checkbox = NSButton(checkboxWithTitle: "Smart refresh (every 5 min above 80% usage)",
                                      target: self, action: #selector(intelligentToggled(_:)))
             checkbox.frame = NSRect(x: 18, y: 25, width: 290, height: 30)
             checkbox.state = intelligentUpdate ? .on : .off
@@ -125,7 +175,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func sliderChanged(_ sender: NSSlider) {
         let minutes = sender.doubleValue.rounded()
         refreshMinutes = minutes
-        sliderLabel?.stringValue = "Aktualisierung alle \(Int(minutes)) Min."
+        sliderLabel?.stringValue = "Refresh every \(Int(minutes)) min"
         scheduleNext()
     }
 
@@ -135,20 +185,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func fetchUsage() -> (text: String, session: Int, week: Int) {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: claudePath)
-        task.arguments = ["--print", "/usage"]
-        let outPipe = Pipe()
-        task.standardOutput = outPipe
-        task.standardError = Pipe()
-        do {
-            try task.run()
-        } catch {
+        guard let output = runDisclaimed(claudePath, ["--print", "/usage"]) else {
             return ("Claude ⚠︎", 0, 0)
         }
-        task.waitUntilExit()
-        let data = outPipe.fileHandleForReading.readDataToEndOfFile()
-        guard let output = String(data: data, encoding: .utf8) else { return ("Claude ⚠︎", 0, 0) }
 
         func extract(_ pattern: String) -> String? {
             guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
